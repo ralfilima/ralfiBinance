@@ -1,12 +1,6 @@
 .env
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-backtest_data/
 logs/
 *.db
-*.sqlite3
+.pytest_cache/

@@ -1,1062 +1,658 @@
-#!/usr/bin/env python3
 """
-main.py - Ponto de entrada do Bot de Trading Binance Futures.
-Menu interativo com opcao de Testnet e Conta Real.
+main.py - DCA Bot Inteligente v1.0
+Menu interativo + Dashboard visual em tempo real.
 
-v3.0 - Correcoes:
-  - Dashboard 100% a prova de erros (try/except em cada secao)
-  - KeyError 'P&L Diario' corrigido (acesso seguro a dicts)
-  - Loop principal separado: monitor, entradas e dashboard independentes
-  - Auto-resume apos cooldown de perdas consecutivas
-  - Cooldown por simbolo apos fechamento (evita re-entrada imediata)
-
-DISCLAIMER: Este bot e uma ferramenta de auxilio a decisao.
-O usuario final e o unico responsavel por qualquer perda financeira.
-Opere por sua conta e risco.
+Filosofia:
+  - 5 moedas simultaneas, sempre as melhores
+  - DCA automatico quando uma moeda cai
+  - Stop Profit GLOBAL: quando a soma das 5 da lucro, fecha TUDO
+  - Ciclos infinitos: fecha, seleciona novas 5, recomeça
 """
 
 import os
 import sys
 import time
-import signal
 import threading
 from datetime import datetime
 
-from colorama import Fore, Back, Style, init
-
-init(autoreset=True)
-
-# Adicionar diretorio ao path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from config import (
-    get_api_keys, validate_config, print_config_summary,
-    LEVERAGE, ENTRY_INTERVAL_SECONDS, ENTRY_JITTER_SECONDS,
-    MONITOR_INTERVAL_SECONDS, DASHBOARD_REFRESH_SECONDS,
-    MAX_OPEN_POSITIONS, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    MAX_CONSECUTIVE_LOSSES, CONSECUTIVE_LOSS_COOLDOWN,
-    SELECTION_INTERVAL_SECONDS
+    get_api_keys, validate_config,
+    NUM_COINS, LEVERAGE, CAPITAL_PER_COIN_PCT,
+    GLOBAL_TAKE_PROFIT_PCT, GLOBAL_TAKE_PROFIT_USDT, GLOBAL_STOP_LOSS_PCT,
+    DCA_LEVELS, MAX_DCA_ORDERS, INITIAL_ENTRY_PCT,
+    MONITOR_INTERVAL, DCA_CHECK_INTERVAL, DASHBOARD_INTERVAL,
+    TIMEFRAME,
 )
 from binance_client import BinanceClientWrapper
-from strategy_engine import StrategyEngine
-from risk_manager import RiskManager
-from position_manager import PositionManager, Position
-from telegram_notifier import TelegramNotifier
-from backtest_engine import BacktestEngine
+from dca_engine import DCAEngine
+from coin_selector import select_best_coins
+from portfolio_manager import PortfolioManager
 from utils.logger import logger
-from utils.helpers import (
-    clear_screen, print_header, print_separator, print_success,
-    print_error, print_warning, print_info, format_pnl, format_percent,
-    get_jitter, safe_float
-)
+from utils.helpers import format_pnl, format_pct, format_price, timestamp_str
 
 
 # ============================================
-# VARIAVEIS GLOBAIS
+# CORES ANSI
 # ============================================
-bot_running = False
-shutdown_event = threading.Event()
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    BG_RED = "\033[41m"
+    BG_GREEN = "\033[42m"
+    BG_BLUE = "\033[44m"
+    BG_YELLOW = "\033[43m"
 
-# Cooldown por simbolo apos fechamento (segundos)
-SYMBOL_COOLDOWN = 300  # 5 minutos
+
+def clear():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def pnl_color(val):
+    if val > 0:
+        return C.GREEN
+    elif val < 0:
+        return C.RED
+    return C.WHITE
+
+
+def bar_chart(value, max_val, width=20, positive_char="█", negative_char="░"):
+    """Cria uma barra visual."""
+    if max_val == 0:
+        return " " * width
+    ratio = min(abs(value) / max_val, 1.0)
+    filled = int(ratio * width)
+    if value >= 0:
+        return f"{C.GREEN}{positive_char * filled}{C.DIM}{'─' * (width - filled)}{C.RESET}"
+    else:
+        return f"{C.RED}{negative_char * filled}{C.DIM}{'─' * (width - filled)}{C.RESET}"
+
+
+def progress_bar(current, target, width=30):
+    """Barra de progresso para o stop profit global."""
+    if target == 0:
+        return "─" * width
+    ratio = max(0, min(current / target, 1.0))
+    filled = int(ratio * width)
+    pct = ratio * 100
+
+    if ratio >= 1.0:
+        color = C.GREEN + C.BOLD
+        char = "█"
+    elif ratio >= 0.5:
+        color = C.YELLOW
+        char = "▓"
+    else:
+        color = C.CYAN
+        char = "░"
+
+    bar = f"{color}{char * filled}{C.DIM}{'─' * (width - filled)}{C.RESET}"
+    return f"{bar} {pct:.1f}%"
 
 
 # ============================================
-# BANNER E MENU
+# BANNER
 # ============================================
-def print_banner():
-    """Exibe banner do bot."""
-    clear_screen()
-    print(f"""
-{Fore.CYAN}╔══════════════════════════════════════════════════════════╗
-║                                                          ║
-║   {Fore.YELLOW}██████╗  ██╗███╗   ██╗ █████╗ ███╗   ██╗ ██████╗███████╗{Fore.CYAN}║
-║   {Fore.YELLOW}██╔══██╗ ██║████╗  ██║██╔══██╗████╗  ██║██╔════╝██╔════╝{Fore.CYAN}║
-║   {Fore.YELLOW}██████╔╝ ██║██╔██╗ ██║███████║██╔██╗ ██║██║     █████╗  {Fore.CYAN}║
-║   {Fore.YELLOW}██╔══██╗ ██║██║╚██╗██║██╔══██║██║╚██╗██║██║     ██╔══╝  {Fore.CYAN}║
-║   {Fore.YELLOW}██████╔╝ ██║██║ ╚████║██║  ██║██║ ╚████║╚██████╗███████╗{Fore.CYAN}║
-║   {Fore.YELLOW}╚═════╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝╚══════╝{Fore.CYAN}║
-║                                                          ║
-║   {Fore.WHITE}Bot de Trading Automatizado - Futuros Scalping{Fore.CYAN}          ║
-║   {Fore.WHITE}Versao 3.0.0{Fore.CYAN}                                            ║
-║                                                          ║
-╚══════════════════════════════════════════════════════════╝{Style.RESET_ALL}
-""")
+BANNER = f"""
+{C.CYAN}{C.BOLD}
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║     ██████╗  ██████╗ █████╗     ██████╗  ██████╗ ████████╗   ║
+║     ██╔══██╗██╔════╝██╔══██╗    ██╔══██╗██╔═══██╗╚══██╔══╝   ║
+║     ██║  ██║██║     ███████║    ██████╔╝██║   ██║   ██║      ║
+║     ██║  ██║██║     ██╔══██║    ██╔══██╗██║   ██║   ██║      ║
+║     ██████╔╝╚██████╗██║  ██║    ██████╔╝╚██████╔╝   ██║      ║
+║     ╚═════╝  ╚═════╝╚═╝  ╚═╝    ╚═════╝  ╚═════╝    ╚═╝      ║
+║                                                              ║
+║          Dollar Cost Averaging Inteligente v1.0              ║
+║          5 Moedas + DCA Auto + Stop Profit Global            ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+{C.RESET}"""
 
 
-def print_disclaimer():
-    """Exibe disclaimer obrigatorio."""
-    print(f"""
-{Fore.RED}{'='*60}
-  AVISO IMPORTANTE - LEIA COM ATENCAO
-{'='*60}{Style.RESET_ALL}
-{Fore.YELLOW}
-  Este bot e uma ferramenta de AUXILIO a decisao de trading.
-  
-  - NAO ha garantia de lucros.
-  - Operar futuros com alavancagem envolve ALTO RISCO.
-  - Voce pode perder TODO o seu capital investido.
-  - O usuario e o UNICO responsavel por perdas financeiras.
-  - Use SEMPRE a Testnet antes de operar com dinheiro real.
-  - Nunca invista mais do que pode perder.
-{Style.RESET_ALL}
-{Fore.RED}{'='*60}{Style.RESET_ALL}
-""")
+DISCLAIMER = f"""
+{C.YELLOW}{C.BOLD}⚠  AVISO DE RISCO{C.RESET}
+{C.YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Trading de criptomoedas envolve risco significativo de perda.
+Este bot e uma ferramenta automatizada, NAO uma garantia de lucro.
+Use apenas capital que voce pode perder.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}
+"""
 
 
+# ============================================
+# MENU DE SELECAO DE MODO
+# ============================================
 def select_mode() -> bool:
-    """Menu de selecao de modo: Testnet ou Conta Real."""
-    print(f"""
-{Fore.CYAN}┌──────────────────────────────────────────┐
-│       SELECIONE O MODO DE OPERACAO       │
-├──────────────────────────────────────────┤
-│                                          │
-│   {Fore.GREEN}[1]{Fore.CYAN} TESTNET (Simulacao)                 │
-│       Ambiente seguro para testes        │
-│       Sem risco financeiro real          │
-│                                          │
-│   {Fore.RED}[2]{Fore.CYAN} CONTA REAL (Mainnet)                │
-│       Operacoes com dinheiro real        │
-│       USE COM EXTREMA CAUTELA            │
-│                                          │
-│   {Fore.WHITE}[0]{Fore.CYAN} Sair                                │
-│                                          │
-└──────────────────────────────────────────┘{Style.RESET_ALL}
-""")
-    
+    """Seleciona Testnet ou Conta Real. Retorna True para testnet."""
+    print(f"\n{C.BOLD}Selecione o modo de operacao:{C.RESET}\n")
+    print(f"  {C.GREEN}[1]{C.RESET} TESTNET (simulacao segura)")
+    print(f"  {C.RED}[2]{C.RESET} CONTA REAL (dinheiro real)")
+    print()
+
     while True:
-        choice = input(f"{Fore.WHITE}  Escolha [0/1/2]: {Style.RESET_ALL}").strip()
-        
-        if choice == "0":
-            print_info("Saindo...")
-            sys.exit(0)
-        elif choice == "1":
-            return True  # Testnet
+        choice = input(f"{C.CYAN}Escolha (1/2): {C.RESET}").strip()
+        if choice == "1":
+            print(f"\n{C.GREEN}✓ Modo TESTNET selecionado{C.RESET}")
+            return True
         elif choice == "2":
-            # Confirmacao extra para conta real
-            print(f"\n{Fore.RED}  ATENCAO: Voce esta prestes a operar com DINHEIRO REAL!")
-            print(f"  Todas as operacoes terao impacto financeiro real.{Style.RESET_ALL}\n")
-            confirm = input(f"  {Fore.YELLOW}Digite 'CONFIRMO' para continuar: {Style.RESET_ALL}").strip()
+            print(f"\n{C.RED}{C.BOLD}⚠  ATENCAO: Modo CONTA REAL{C.RESET}")
+            print(f"{C.RED}Voce esta prestes a operar com dinheiro REAL.{C.RESET}")
+            confirm = input(f"\nDigite {C.RED}{C.BOLD}CONFIRMO{C.RESET} para continuar: ").strip()
             if confirm == "CONFIRMO":
-                return False  # Conta Real
+                print(f"\n{C.RED}✓ Modo CONTA REAL ativado{C.RESET}")
+                return False
             else:
-                print_warning("Operacao cancelada. Voltando ao menu...")
-                continue
+                print(f"{C.YELLOW}Cancelado. Voltando ao menu.{C.RESET}")
         else:
-            print_error("Opcao invalida. Tente novamente.")
+            print(f"{C.YELLOW}Opcao invalida.{C.RESET}")
 
 
-def main_menu(use_testnet: bool) -> str:
-    """Menu principal do bot."""
-    mode_text = f"{Fore.GREEN}TESTNET" if use_testnet else f"{Fore.RED}CONTA REAL"
-    mode_icon = "[T]" if use_testnet else "[$]"
-    
+# ============================================
+# DASHBOARD
+# ============================================
+def render_dashboard(portfolio: PortfolioManager, dca: DCAEngine,
+                     status: str = "Operando", last_action: str = ""):
+    """Renderiza o dashboard completo no terminal."""
+    try:
+        clear()
+        stats = portfolio.get_session_stats()
+        positions = dca.get_all_summaries()
+        now = datetime.now().strftime("%H:%M:%S")
+        mode = "TESTNET" if portfolio.client.testnet else "REAL"
+        mode_color = C.GREEN if portfolio.client.testnet else C.RED
+
+        # === HEADER ===
+        print(f"{C.CYAN}{C.BOLD}{'═' * 80}{C.RESET}")
+        print(f"{C.CYAN}{C.BOLD}  DCA BOT INTELIGENTE v1.0  {C.RESET}"
+              f"│ {mode_color}{C.BOLD}{mode}{C.RESET} "
+              f"│ {C.DIM}{now}{C.RESET} "
+              f"│ Status: {C.BOLD}{status}{C.RESET}")
+        print(f"{C.CYAN}{C.BOLD}{'═' * 80}{C.RESET}")
+
+        # === SALDO E P&L ===
+        balance = stats["saldo_atual"]
+        pnl_total = stats["pnl_total"]
+        pnl_realizado = stats["pnl_realizado"]
+        pnl_nao_realizado = stats["pnl_nao_realizado"]
+        target = stats["target_tp"]
+        progresso = stats["progresso_tp"]
+
+        print(f"\n  {C.BOLD}SALDO{C.RESET}: {C.WHITE}{C.BOLD}{balance:.2f} USDT{C.RESET}"
+              f"  │  {C.BOLD}P&L Sessao{C.RESET}: {pnl_color(pnl_total)}{C.BOLD}{format_pnl(pnl_total)} USDT{C.RESET}"
+              f"  │  {C.BOLD}Ciclos{C.RESET}: {stats['ciclos']}")
+
+        print(f"  {C.DIM}Realizado: {format_pnl(pnl_realizado)}{C.RESET}"
+              f"  │  {C.DIM}Nao Realizado: {format_pnl(pnl_nao_realizado)}{C.RESET}"
+              f"  │  {C.DIM}Win Rate: {stats['win_rate']:.0f}%{C.RESET}")
+
+        # === BARRA DE PROGRESSO DO STOP PROFIT ===
+        print(f"\n  {C.BOLD}STOP PROFIT GLOBAL{C.RESET} (target: {format_pnl(target)} USDT)")
+        print(f"  {progress_bar(pnl_nao_realizado, target, 50)}")
+
+        # === TABELA DE POSICOES ===
+        print(f"\n  {C.BOLD}{'─' * 76}{C.RESET}")
+        print(f"  {C.BOLD}{'MOEDA':<12} {'DIR':>5} {'QTD':>10} {'PRECO MEDIO':>12} "
+              f"{'PRECO ATUAL':>12} {'P&L':>10} {'P&L%':>7} {'DCA':>5} {'STATUS':>8}{C.RESET}")
+        print(f"  {C.DIM}{'─' * 76}{C.RESET}")
+
+        if not positions:
+            print(f"  {C.DIM}  Nenhuma posicao aberta. Aguardando selecao de moedas...{C.RESET}")
+        else:
+            # Encontrar max P&L para a barra
+            max_pnl = max(abs(p.get("pnl", 0)) for p in positions) if positions else 1
+
+            for p in positions:
+                symbol = p["symbol"].replace("USDT", "")
+                direction = p["direction"]
+                dir_color = C.GREEN if direction == "LONG" else C.RED
+                pnl = p.get("pnl", 0)
+                pnl_pct = p.get("pnl_pct", 0)
+                pc = pnl_color(pnl)
+                dca_str = f"{p['dca_count']}/{p['max_dca']}"
+
+                # Icone de status
+                if pnl > 0:
+                    status_icon = f"{C.GREEN}✓ LUCRO{C.RESET}"
+                elif p["dca_count"] >= p["max_dca"]:
+                    status_icon = f"{C.RED}MAX DCA{C.RESET}"
+                elif p["dca_count"] > 0:
+                    status_icon = f"{C.YELLOW}DCA #{p['dca_count']}{C.RESET}"
+                else:
+                    status_icon = f"{C.CYAN}ENTRY{C.RESET}"
+
+                print(
+                    f"  {C.BOLD}{symbol:<12}{C.RESET} "
+                    f"{dir_color}{direction:>5}{C.RESET} "
+                    f"{p['qty']:>10.4f} "
+                    f"{format_price(p['avg_price']):>12} "
+                    f"{format_price(p['current_price']):>12} "
+                    f"{pc}{format_pnl(pnl):>10}{C.RESET} "
+                    f"{pc}{pnl_pct:>6.2f}%{C.RESET} "
+                    f"{C.YELLOW}{dca_str:>5}{C.RESET} "
+                    f"{status_icon}"
+                )
+
+                # Barra visual do P&L
+                print(f"  {'':>12} {bar_chart(pnl, max_pnl, 40)}")
+
+        print(f"  {C.BOLD}{'─' * 76}{C.RESET}")
+
+        # === RESUMO DO PORTFOLIO ===
+        n_lucro = stats["posicoes_lucro"]
+        n_perda = stats["posicoes_prejuizo"]
+        n_total = stats["posicoes_ativas"]
+
+        print(f"\n  {C.GREEN}● Lucro: {n_lucro}{C.RESET}"
+              f"  {C.RED}● Perda: {n_perda}{C.RESET}"
+              f"  {C.WHITE}● Total: {n_total}/{NUM_COINS}{C.RESET}"
+              f"  │  {C.DIM}Duracao: {stats['duracao_min']:.0f} min{C.RESET}")
+
+        # === STOP LOSS GLOBAL ===
+        sl_limit = stats["limite_sl"]
+        sl_pct = (pnl_nao_realizado / sl_limit * 100) if sl_limit != 0 else 0
+        if sl_pct > 50:
+            sl_color = C.RED + C.BOLD
+        elif sl_pct > 25:
+            sl_color = C.YELLOW
+        else:
+            sl_color = C.DIM
+        print(f"  {sl_color}Stop Loss Global: {format_pnl(sl_limit)} USDT "
+              f"({sl_pct:.0f}% usado){C.RESET}")
+
+        # === ULTIMA ACAO ===
+        if last_action:
+            print(f"\n  {C.MAGENTA}Ultima acao: {last_action}{C.RESET}")
+
+        # === HISTORICO DE CICLOS ===
+        if stats["historico"]:
+            print(f"\n  {C.BOLD}Historico de Ciclos:{C.RESET}")
+            for h in stats["historico"][-5:]:
+                hpc = pnl_color(h["pnl"])
+                print(f"  {C.DIM}#{h['cycle']} {h['time']}{C.RESET} "
+                      f"│ {hpc}{format_pnl(h['pnl'])} USDT{C.RESET} "
+                      f"│ {h['reason']} │ {h['duration_min']:.1f}min")
+
+        # === RODAPE ===
+        print(f"\n{C.DIM}  [Ctrl+C] Parar bot  │  Atualizando a cada {DASHBOARD_INTERVAL}s{C.RESET}")
+        print(f"{C.CYAN}{'═' * 80}{C.RESET}")
+
+    except Exception as e:
+        logger.error(f"Erro no dashboard: {e}")
+
+
+# ============================================
+# MENU PRINCIPAL
+# ============================================
+def show_menu():
+    """Exibe o menu principal."""
     print(f"""
-{Fore.CYAN}┌──────────────────────────────────────────┐
-│          MENU PRINCIPAL                  │
-│          Modo: {mode_icon} {mode_text}{Fore.CYAN}                   │
-├──────────────────────────────────────────┤
-│                                          │
-│   {Fore.GREEN}[1]{Fore.CYAN} Iniciar Bot Automatico              │
-│   {Fore.GREEN}[2]{Fore.CYAN} Ver Saldo e Posicoes                │
-│   {Fore.GREEN}[3]{Fore.CYAN} Analise de Mercado                  │
-│   {Fore.GREEN}[4]{Fore.CYAN} Executar Backtest                   │
-│   {Fore.GREEN}[5]{Fore.CYAN} Configuracoes                       │
-│   {Fore.GREEN}[6]{Fore.CYAN} Testar Telegram                     │
-│   {Fore.GREEN}[7]{Fore.CYAN} Trocar Modo (Testnet/Real)          │
-│   {Fore.GREEN}[8]{Fore.CYAN} Fechar Todas as Posicoes            │
-│                                          │
-│   {Fore.WHITE}[0]{Fore.CYAN} Sair                                │
-│                                          │
-└──────────────────────────────────────────┘{Style.RESET_ALL}
+{C.BOLD}  MENU PRINCIPAL{C.RESET}
+{C.DIM}  ─────────────────────────────────{C.RESET}
+  {C.GREEN}[1]{C.RESET} Iniciar Bot (modo automatico)
+  {C.CYAN}[2]{C.RESET} Ver saldo e posicoes
+  {C.YELLOW}[3]{C.RESET} Selecionar moedas (preview)
+  {C.MAGENTA}[4]{C.RESET} Configuracoes atuais
+  {C.RED}[5]{C.RESET} Fechar todas as posicoes
+  {C.DIM}[6]{C.RESET} Trocar modo (Testnet/Real)
+  {C.DIM}[0]{C.RESET} Sair
 """)
-    
-    choice = input(f"{Fore.WHITE}  Escolha [0-8]: {Style.RESET_ALL}").strip()
-    return choice
 
 
-# ============================================
-# FUNCOES DO MENU
-# ============================================
-def show_balance_and_positions(client: BinanceClientWrapper):
-    """Exibe saldo e posicoes abertas."""
-    print_header("SALDO E POSICOES")
-    
+def show_balance(client: BinanceClientWrapper):
+    """Mostra saldo e posicoes abertas."""
     try:
-        balance = client.get_futures_balance()
-        print(f"\n  {Fore.WHITE}Saldo USDT: {Fore.GREEN}{balance:,.2f} USDT{Style.RESET_ALL}")
-        
+        balance = client.get_balance()
         positions = client.get_open_positions()
-        
+
+        print(f"\n  {C.BOLD}Saldo USDT:{C.RESET} {C.WHITE}{C.BOLD}{balance:.2f}{C.RESET}")
+        print(f"  {C.BOLD}Posicoes abertas:{C.RESET} {len(positions)}")
+
         if positions:
-            print(f"\n  {Fore.YELLOW}Posicoes Abertas ({len(positions)}):{Style.RESET_ALL}\n")
-            
-            print(f"  {'Simbolo':<12} {'Direcao':<8} {'Qtd':<12} {'Entrada':<12} {'P&L':>12}")
-            print_separator("-", 60)
-            
-            total_pnl = 0
-            for pos in positions:
-                pnl = pos['unrealized_pnl']
-                total_pnl += pnl
-                pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-                side_color = Fore.GREEN if pos['side'] == 'LONG' else Fore.RED
-                
-                print(
-                    f"  {Fore.WHITE}{pos['symbol']:<12}"
-                    f"{side_color}{pos['side']:<8}"
-                    f"{Fore.WHITE}{pos['quantity']:<12.4f}"
-                    f"{pos['entry_price']:<12.4f}"
-                    f"{pnl_color}{pnl:>+12.2f}{Style.RESET_ALL}"
-                )
-            
-            print_separator("-", 60)
-            total_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-            print(f"  {'P&L Total:':<44}{total_color}{total_pnl:>+12.2f} USDT{Style.RESET_ALL}")
-        else:
-            print(f"\n  {Fore.YELLOW}Nenhuma posicao aberta.{Style.RESET_ALL}")
-        
-        # Status do circuit breaker
-        cb_status = client.get_circuit_status()
-        print(f"\n  {Fore.WHITE}Circuit Breaker: {cb_status.get('estado', 'N/A')} "
-              f"(Falhas: {cb_status.get('falhas', 0)}){Style.RESET_ALL}")
-        
-        # Modo SL/TP
-        sl_mode = "SOFTWARE" if not client.exchange_sl_tp_supported else "EXCHANGE"
-        print(f"  {Fore.WHITE}Modo SL/TP: {sl_mode}{Style.RESET_ALL}")
-        
+            print(f"\n  {'Simbolo':<12} {'Lado':>6} {'Qtd':>12} {'Entrada':>12} {'P&L':>12}")
+            print(f"  {'─' * 56}")
+            for p in positions:
+                pc = pnl_color(p["unrealized_pnl"])
+                print(f"  {p['symbol']:<12} {p['side']:>6} {p['quantity']:>12.4f} "
+                      f"{p['entry_price']:>12.4f} {pc}{p['unrealized_pnl']:>+12.4f}{C.RESET}")
     except Exception as e:
-        print_error(f"Erro ao consultar saldo: {e}")
-    
-    input(f"\n  {Fore.WHITE}Pressione Enter para voltar...{Style.RESET_ALL}")
+        print(f"\n  {C.RED}Erro: {e}{C.RESET}")
 
-
-def show_market_analysis(client: BinanceClientWrapper):
-    """Executa e exibe analise de mercado."""
-    print_header("ANALISE DE MERCADO")
-    
-    try:
-        engine = StrategyEngine(client)
-        
-        print_info("Selecionando ativos (pode levar ~1 minuto)...")
-        assets = engine.select_assets()
-        
-        if not assets:
-            print_warning("Nenhum ativo selecionado. Tente novamente mais tarde.")
-            input(f"\n  Pressione Enter para voltar...")
-            return
-        
-        # Tendencia BTC
-        btc_trend = engine.analyze_btc_trend()
-        print(f"\n  {Fore.WHITE}Tendencia BTC: ", end="")
-        if btc_trend == "ALTA":
-            print(f"{Fore.GREEN}ALTA{Style.RESET_ALL}")
-        elif btc_trend == "BAIXA":
-            print(f"{Fore.RED}BAIXA{Style.RESET_ALL}")
-        else:
-            print(f"{Fore.YELLOW}LATERAL{Style.RESET_ALL}")
-        
-        # Analise individual
-        print(f"\n  {Fore.YELLOW}Analise dos Ativos Selecionados:{Style.RESET_ALL}\n")
-        
-        summaries = engine.get_analysis_summary()
-        
-        if summaries:
-            print(f"  {'Simbolo':<12} {'Preco':<12} {'EMA9':<12} {'EMA21':<12} "
-                  f"{'RSI':<8} {'ATR':<10} {'Sinal':<8}")
-            print_separator("-", 80)
-            
-            for s in summaries:
-                signal = s.get("Sinal", "NONE")
-                signal_color = Fore.GREEN if signal == "LONG" else (Fore.RED if signal == "SHORT" else Fore.WHITE)
-                
-                print(
-                    f"  {Fore.WHITE}{s.get('Simbolo', 'N/A'):<12}"
-                    f"{s.get('Preco', 'N/A'):<12}"
-                    f"{s.get('EMA9', 'N/A'):<12}"
-                    f"{s.get('EMA21', 'N/A'):<12}"
-                    f"{s.get('RSI', 'N/A'):<8}"
-                    f"{s.get('ATR', 'N/A'):<10}"
-                    f"{signal_color}{signal:<8}{Style.RESET_ALL}"
-                )
-        else:
-            print_warning("Nenhum dado de analise disponivel.")
-    
-    except Exception as e:
-        print_error(f"Erro na analise: {e}")
-    
-    input(f"\n  {Fore.WHITE}Pressione Enter para voltar...{Style.RESET_ALL}")
-
-
-def run_backtest_menu(client: BinanceClientWrapper):
-    """Menu de backtesting."""
-    print_header("BACKTESTING")
-    
-    try:
-        engine = BacktestEngine(client)
-        
-        print(f"\n  {Fore.WHITE}Simbolo para backtest (ex: BTCUSDT): ", end="")
-        symbol = input().strip().upper()
-        
-        if not symbol:
-            symbol = "BTCUSDT"
-        
-        print_info(f"Executando backtest para {symbol}...")
-        print_info("Isso pode levar alguns minutos...")
-        
-        results = engine.run(symbol)
-        
-        if results:
-            print(f"\n  {Fore.YELLOW}--- RESULTADOS DO BACKTEST ---{Style.RESET_ALL}\n")
-            for key, val in results.items():
-                print(f"  {Fore.CYAN}{key:<30}{Fore.WHITE}{val}{Style.RESET_ALL}")
-        else:
-            print_warning("Backtest nao retornou resultados.")
-    
-    except Exception as e:
-        print_error(f"Erro no backtest: {e}")
-    
-    input(f"\n  {Fore.WHITE}Pressione Enter para voltar...{Style.RESET_ALL}")
+    input(f"\n  {C.DIM}Pressione Enter para voltar...{C.RESET}")
 
 
 def show_config(use_testnet: bool):
-    """Exibe configuracoes atuais."""
-    print_header("CONFIGURACOES ATUAIS")
-    
-    summary = print_config_summary(use_testnet)
-    print()
-    for key, val in summary.items():
-        print(f"  {Fore.CYAN}{key:<25}{Fore.WHITE}{val}{Style.RESET_ALL}")
-    
-    input(f"\n  {Fore.WHITE}Pressione Enter para voltar...{Style.RESET_ALL}")
+    """Mostra configuracoes atuais."""
+    mode = "TESTNET" if use_testnet else "CONTA REAL"
+    tp_str = f"{GLOBAL_TAKE_PROFIT_USDT:.2f} USDT" if GLOBAL_TAKE_PROFIT_USDT > 0 else f"{GLOBAL_TAKE_PROFIT_PCT*100:.2f}%"
 
-
-def test_telegram():
-    """Testa conexao com Telegram."""
-    print_header("TESTE DE TELEGRAM")
-    
-    notifier = TelegramNotifier()
-    
-    if not notifier.enabled:
-        print_error("Telegram nao configurado. Verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID no .env")
-        input(f"\n  Pressione Enter para voltar...")
-        return
-    
-    print_info("Testando conexao...")
-    
-    if notifier.test_connection():
-        print_success("Conexao com Telegram OK!")
-        
-        print_info("Enviando mensagem de teste...")
-        if notifier.send_message("Teste de conexao do Bot de Trading - OK!"):
-            print_success("Mensagem enviada com sucesso!")
-        else:
-            print_error("Falha ao enviar mensagem.")
-    else:
-        print_error("Falha na conexao com Telegram.")
-    
-    input(f"\n  {Fore.WHITE}Pressione Enter para voltar...{Style.RESET_ALL}")
-
-
-def close_all_positions_menu(client: BinanceClientWrapper):
-    """Menu para fechar todas as posicoes."""
-    print_header("FECHAR TODAS AS POSICOES")
-    
-    try:
-        positions = client.get_open_positions()
-        
-        if not positions:
-            print_info("Nenhuma posicao aberta.")
-            input(f"\n  Pressione Enter para voltar...")
-            return
-        
-        print(f"\n  {Fore.YELLOW}Posicoes que serao fechadas:{Style.RESET_ALL}\n")
-        for pos in positions:
-            side_color = Fore.GREEN if pos['side'] == 'LONG' else Fore.RED
-            print(f"  {pos['symbol']} | {side_color}{pos['side']}{Style.RESET_ALL} | "
-                  f"Qtd: {pos['quantity']:.4f}")
-        
-        confirm = input(f"\n  {Fore.RED}Confirma fechamento? (s/n): {Style.RESET_ALL}").strip().lower()
-        
-        if confirm == "s":
-            print_info("Fechando posicoes...")
-            closed = client.close_all_positions()
-            print_success(f"{closed} posicao(oes) fechada(s).")
-        else:
-            print_info("Operacao cancelada.")
-    
-    except Exception as e:
-        print_error(f"Erro: {e}")
-    
-    input(f"\n  {Fore.WHITE}Pressione Enter para voltar...{Style.RESET_ALL}")
-
-
-# ============================================
-# DASHBOARD EM TEMPO REAL (v3.0 - a prova de erros)
-# ============================================
-def print_dashboard(client, risk_manager, position_manager,
-                     strategy, use_testnet, last_action="", symbol_cooldowns=None):
-    """Imprime dashboard atualizado no terminal. Nunca levanta excecao."""
-    try:
-        clear_screen()
-    except Exception:
-        pass
-    
-    mode = f"{Fore.GREEN}TESTNET" if use_testnet else f"{Fore.RED}CONTA REAL"
-    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    
-    # Modo SL/TP
-    try:
-        sl_mode = "SOFTWARE" if not client.exchange_sl_tp_supported else "EXCHANGE"
-    except Exception:
-        sl_mode = "N/A"
-    
     print(f"""
-{Fore.CYAN}╔══════════════════════════════════════════════════════════╗
-║  {Fore.YELLOW}BINANCE FUTURES SCALPING BOT v3.0{Fore.CYAN}                        ║
-║  Modo: {mode}{Fore.CYAN} | SL/TP: {Fore.WHITE}{sl_mode}{Fore.CYAN} | {Fore.WHITE}{now_str}{Fore.CYAN}       ║
-╚══════════════════════════════════════════════════════════╝{Style.RESET_ALL}
+  {C.BOLD}CONFIGURACOES ATUAIS{C.RESET}
+  {C.DIM}─────────────────────────────────{C.RESET}
+  Modo:              {C.BOLD}{mode}{C.RESET}
+  Moedas:            {NUM_COINS} simultaneas
+  Alavancagem:       {LEVERAGE}x
+  Timeframe:         {TIMEFRAME}
+  Capital/Moeda:     {CAPITAL_PER_COIN_PCT*100:.0f}% do saldo
+  Entrada Inicial:   {INITIAL_ENTRY_PCT*100:.0f}% do capital da moeda
+
+  {C.BOLD}STOP PROFIT GLOBAL{C.RESET}
+  Target:            {tp_str}
+  Stop Loss:         {GLOBAL_STOP_LOSS_PCT*100:.1f}%
+
+  {C.BOLD}DCA LEVELS{C.RESET}
 """)
-    
-    # === RESUMO DE RISCO (acesso seguro a todas as chaves) ===
-    try:
-        risk = risk_manager.get_risk_summary()
-        saldo = risk.get("Saldo Atual", "N/A")
-        pnl_diario = risk.get("P&L Diário", risk.get("P&L Diario", "N/A"))
-        pnl_sessao = risk.get("P&L Sessão", risk.get("P&L Sessao", "N/A"))
-        drawdown = risk.get("Drawdown Atual", "N/A")
-        win_rate = risk.get("Win Rate", "N/A")
-        status = risk.get("Status", "N/A")
-        total_trades = risk.get("Total Trades", 0)
-        perdas_consec = risk.get("Perdas Consecutivas", "N/A")
-        
-        status_color = Fore.GREEN if status == "ATIVO" else Fore.RED
-        
-        print(f"  {Fore.YELLOW}--- RESUMO DE RISCO ---{Style.RESET_ALL}")
-        print(f"  Saldo: {Fore.WHITE}{saldo}{Style.RESET_ALL}  |  "
-              f"P&L Diario: {Fore.WHITE}{pnl_diario}{Style.RESET_ALL}  |  "
-              f"P&L Sessao: {Fore.WHITE}{pnl_sessao}{Style.RESET_ALL}")
-        print(f"  Drawdown: {Fore.WHITE}{drawdown}{Style.RESET_ALL}  |  "
-              f"Win Rate: {Fore.WHITE}{win_rate}{Style.RESET_ALL}  |  "
-              f"Trades: {Fore.WHITE}{total_trades}{Style.RESET_ALL}  |  "
-              f"Status: {status_color}{status}{Style.RESET_ALL}")
-        print(f"  Perdas Consec: {Fore.WHITE}{perdas_consec}{Style.RESET_ALL}")
-        
-        if risk_manager.is_paused:
-            elapsed = time.time() - risk_manager.pause_time if risk_manager.pause_time > 0 else 0
-            remaining = max(0, CONSECUTIVE_LOSS_COOLDOWN - elapsed)
-            print(f"  {Fore.RED}PAUSADO: {risk_manager.pause_reason} "
-                  f"(retoma em {remaining:.0f}s){Style.RESET_ALL}")
-    except Exception as e:
-        print(f"  {Fore.RED}Erro ao carregar risco: {e}{Style.RESET_ALL}")
-    
-    # === CIRCUIT BREAKER ===
-    try:
-        cb = client.get_circuit_status()
-        cb_estado = cb.get("estado", "N/A")
-        cb_falhas = cb.get("falhas", 0)
-        cb_color = Fore.GREEN if cb_estado == "FECHADO" else Fore.RED
-        print(f"  Circuit Breaker: {cb_color}{cb_estado}{Style.RESET_ALL} (Falhas: {cb_falhas})")
-    except Exception:
-        print(f"  Circuit Breaker: {Fore.YELLOW}N/A{Style.RESET_ALL}")
-    
-    # === POSICOES ABERTAS ===
-    try:
-        positions = position_manager.get_positions_summary()
-        pos_count = len(positions)
-        print(f"\n  {Fore.YELLOW}--- POSICOES ABERTAS ({pos_count}/{MAX_OPEN_POSITIONS}) ---{Style.RESET_ALL}")
-        
-        if positions:
-            print(f"  {'Simbolo':<10} {'Dir':<6} {'Entrada':<10} {'Atual':<10} "
-                  f"{'P&L':>8} {'P&L%':>8} {'Trail':>6} {'SL/TP':>6} {'Tempo':>8}")
-            print(f"  {'-'*76}")
-            
-            for p in positions:
-                try:
-                    pnl_str = p.get('P&L', '0')
-                    pnl_val = safe_float(pnl_str.replace('+', '').replace(' ', ''), 0)
-                    pnl_color = Fore.GREEN if pnl_val >= 0 else Fore.RED
-                    direcao = p.get('Direcao', p.get('Direção', 'N/A'))
-                    side_color = Fore.GREEN if direcao == 'LONG' else Fore.RED
-                    
-                    print(
-                        f"  {Fore.WHITE}{p.get('Simbolo', p.get('Símbolo', 'N/A')):<10}"
-                        f"{side_color}{direcao:<6}{Style.RESET_ALL}"
-                        f"{p.get('Entrada', 'N/A'):<10}"
-                        f"{p.get('Atual', 'N/A'):<10}"
-                        f"{pnl_color}{pnl_str:>8}{Style.RESET_ALL}"
-                        f"{pnl_color}{p.get('P&L%', 'N/A'):>8}{Style.RESET_ALL}"
-                        f"{'  ' + p.get('Trailing', 'N/A'):>6}"
-                        f"{'  ' + p.get('SL/TP', 'N/A'):>6}"
-                        f"{'  ' + p.get('Tempo', 'N/A'):>8}"
-                    )
-                except Exception:
-                    print(f"  {Fore.RED}Erro ao exibir posicao{Style.RESET_ALL}")
-            
-            try:
-                total_pnl = position_manager.get_total_unrealized_pnl()
-                total_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-                print(f"  {'-'*76}")
-                print(f"  {'P&L Total Nao Realizado:':<46}"
-                      f"{total_color}{total_pnl:>+10.2f} USDT{Style.RESET_ALL}")
-            except Exception:
-                pass
-        else:
-            print(f"  {Fore.WHITE}Nenhuma posicao aberta{Style.RESET_ALL}")
-    except Exception as e:
-        print(f"  {Fore.RED}Erro ao listar posicoes: {e}{Style.RESET_ALL}")
-    
-    # === ATIVOS MONITORADOS ===
-    try:
-        print(f"\n  {Fore.YELLOW}--- ATIVOS MONITORADOS ---{Style.RESET_ALL}")
-        if strategy.selected_assets:
-            print(f"  {', '.join(strategy.selected_assets)}")
-            print(f"  Tendencia BTC: {strategy.last_btc_trend}")
-        else:
-            print(f"  {Fore.WHITE}Aguardando selecao...{Style.RESET_ALL}")
-    except Exception:
-        print(f"  {Fore.WHITE}N/A{Style.RESET_ALL}")
-    
-    # === COOLDOWNS POR SIMBOLO ===
-    if symbol_cooldowns:
-        try:
-            active_cooldowns = []
-            now = time.time()
-            for sym, cd_time in list(symbol_cooldowns.items()):
-                remaining = cd_time - now
-                if remaining > 0:
-                    active_cooldowns.append(f"{sym}({remaining:.0f}s)")
-            if active_cooldowns:
-                print(f"\n  {Fore.YELLOW}--- COOLDOWNS ---{Style.RESET_ALL}")
-                print(f"  {', '.join(active_cooldowns)}")
-        except Exception:
-            pass
-    
-    # === ULTIMA ACAO ===
-    if last_action:
-        print(f"\n  {Fore.CYAN}Ultima acao: {Fore.WHITE}{last_action}{Style.RESET_ALL}")
-    
-    # === CONTROLES ===
-    print(f"\n  {Fore.CYAN}--- CONTROLES ---{Style.RESET_ALL}")
-    print(f"  {Fore.WHITE}Ctrl+C = Parar bot (fecha posicoes ordenadamente){Style.RESET_ALL}")
+    for i, (pct, cap) in enumerate(DCA_LEVELS):
+        print(f"  Nivel {i+1}: Queda {pct*100:.1f}% -> Adiciona {cap*100:.0f}% do restante")
+
+    print(f"\n  Max DCAs por moeda: {MAX_DCA_ORDERS}")
+    input(f"\n  {C.DIM}Pressione Enter para voltar...{C.RESET}")
+
+
+def preview_coins(client: BinanceClientWrapper):
+    """Preview da selecao de moedas."""
+    print(f"\n  {C.CYAN}Analisando mercado...{C.RESET}")
+    coins = select_best_coins(client)
+
+    if not coins:
+        print(f"\n  {C.RED}Nenhuma moeda encontrada com criterios atuais.{C.RESET}")
+    else:
+        print(f"\n  {C.BOLD}{'#':<3} {'MOEDA':<12} {'DIR':>5} {'SCORE':>6} "
+              f"{'RSI':>5} {'ATR%':>6} {'MOM%':>6} {'VOL':>5} {'PRECO':>12}{C.RESET}")
+        print(f"  {'─' * 62}")
+        for i, c in enumerate(coins, 1):
+            dc = C.GREEN if c["direction"] == "LONG" else C.RED
+            print(f"  {i:<3} {c['symbol']:<12} {dc}{c['direction']:>5}{C.RESET} "
+                  f"{c['score']:>6.3f} {c.get('rsi', 0):>5.1f} "
+                  f"{c.get('atr_pct', 0):>5.2f}% {c.get('momentum', 0):>+5.1f}% "
+                  f"{c.get('vol_ratio', 0):>5.1f} {format_price(c.get('price', 0)):>12}")
+
+    input(f"\n  {C.DIM}Pressione Enter para voltar...{C.RESET}")
+
+
+def close_all_menu(client: BinanceClientWrapper):
+    """Menu para fechar todas as posicoes."""
+    print(f"\n  {C.RED}{C.BOLD}⚠  FECHAR TODAS AS POSICOES{C.RESET}")
+    confirm = input(f"  Tem certeza? (s/n): ").strip().lower()
+    if confirm == "s":
+        closed = client.close_all_positions()
+        print(f"\n  {C.GREEN}{closed} posicoes fechadas.{C.RESET}")
+    else:
+        print(f"  {C.YELLOW}Cancelado.{C.RESET}")
+    input(f"\n  {C.DIM}Pressione Enter para voltar...{C.RESET}")
 
 
 # ============================================
-# LOOP PRINCIPAL DO BOT (v3.0)
+# BOT LOOP PRINCIPAL
 # ============================================
 def run_bot(client: BinanceClientWrapper, use_testnet: bool):
-    """Executa o loop principal do bot."""
-    global bot_running
-    
-    print_header("INICIANDO BOT AUTOMATICO")
-    
-    mode_text = "TESTNET" if use_testnet else "CONTA REAL"
-    
+    """Loop principal do bot DCA."""
+    logger.info("=== DCA Bot iniciado ===")
+
+    # Inicializar componentes
+    dca = DCAEngine(client)
+    portfolio = PortfolioManager(dca, client)
+
+    # Obter saldo
+    balance = client.get_balance()
+    portfolio.initialize(balance)
+
+    print(f"\n  {C.GREEN}{C.BOLD}Bot iniciado!{C.RESET}")
+    print(f"  Saldo: {balance:.2f} USDT")
+    print(f"  Target: {format_pnl(portfolio.get_take_profit_target())} USDT")
+    print(f"\n  {C.DIM}O dashboard vai aparecer em instantes...{C.RESET}")
+    time.sleep(2)
+
+    last_action = "Bot iniciado"
+    status = "Selecionando moedas..."
+    running = True
+    last_dashboard = 0
+    last_dca_check = 0
+    last_price_update = 0
+    last_selection_attempt = 0
+    selection_cooldown = 30  # Esperar 30s entre tentativas de selecao
+
     try:
-        # Verificar saldo
-        balance = client.get_futures_balance()
-        print_success(f"Saldo: {balance:,.2f} USDT")
-        
-        if balance <= 0:
-            print_error("Saldo insuficiente para operar!")
-            input(f"\n  Pressione Enter para voltar...")
-            return
-        
-        # Inicializar componentes
-        risk_manager = RiskManager(balance)
-        position_manager = PositionManager(client, risk_manager)
-        strategy = StrategyEngine(client)
-        notifier = TelegramNotifier()
-        
-        # Cooldowns por simbolo (evita re-entrada imediata)
-        symbol_cooldowns = {}
-        
-        # Fechar posicoes previas
-        print_info("Verificando posicoes previas...")
-        prev_positions = client.get_open_positions()
-        if prev_positions:
-            print_warning(f"Encontradas {len(prev_positions)} posicoes previas. Fechando...")
-            client.close_all_positions()
-            print_success("Posicoes previas fechadas.")
-        
-        # Notificar inicio
-        notifier.notify_bot_start(mode_text, balance)
-        
-        # Registrar comandos do Telegram (acesso seguro a dicts)
-        def cmd_status(text):
-            try:
-                risk = risk_manager.get_risk_summary()
-                pos_count = position_manager.get_open_count()
-                sl_mode = "SOFTWARE" if not client.exchange_sl_tp_supported else "EXCHANGE"
-                return (
-                    f"<b>Status do Bot</b>\n"
-                    f"Saldo: {risk.get('Saldo Atual', 'N/A')}\n"
-                    f"Posicoes: {pos_count}/{MAX_OPEN_POSITIONS}\n"
-                    f"P&L Diario: {risk.get('P&L Diário', risk.get('P&L Diario', 'N/A'))}\n"
-                    f"SL/TP: {sl_mode}\n"
-                    f"Status: {risk.get('Status', 'N/A')}"
-                )
-            except Exception as e:
-                return f"Erro: {e}"
-        
-        def cmd_positions(text):
-            try:
-                positions = position_manager.get_positions_summary()
-                if not positions:
-                    return "Nenhuma posicao aberta"
-                lines = ["<b>Posicoes Abertas</b>\n"]
-                for p in positions:
-                    sym = p.get('Simbolo', p.get('Símbolo', 'N/A'))
-                    direcao = p.get('Direcao', p.get('Direção', 'N/A'))
-                    lines.append(f"{sym} | {direcao} | P&L: {p.get('P&L', 'N/A')} | {p.get('SL/TP', 'N/A')}")
-                return "\n".join(lines)
-            except Exception as e:
-                return f"Erro: {e}"
-        
-        def cmd_pause(text):
-            risk_manager.is_paused = True
-            risk_manager.pause_reason = "Comando Telegram"
-            risk_manager.pause_time = time.time()
-            return "Bot pausado via Telegram"
-        
-        def cmd_resume(text):
-            risk_manager.force_resume()
-            return "Bot retomado via Telegram"
-        
-        def cmd_balance(text):
-            try:
-                bal = client.get_futures_balance()
-                return f"Saldo: {bal:,.2f} USDT"
-            except Exception:
-                return "Erro ao consultar saldo"
-        
-        notifier.register_command("status", cmd_status)
-        notifier.register_command("posicoes", cmd_positions)
-        notifier.register_command("pausar", cmd_pause)
-        notifier.register_command("retomar", cmd_resume)
-        notifier.register_command("saldo", cmd_balance)
-        notifier.start_polling()
-        
-        # Configurar handler de shutdown
-        bot_running = True
-        shutdown_event.clear()
-        
-        def signal_handler(sig, frame):
-            global bot_running
-            bot_running = False
-            shutdown_event.set()
-            print(f"\n\n{Fore.YELLOW}  Recebido sinal de parada. Encerrando...{Style.RESET_ALL}")
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        
-        print_success("Bot iniciado! Pressione Ctrl+C para parar.\n")
-        
-        last_entry_time = 0
-        last_monitor_time = 0
-        last_dashboard_time = 0
-        last_selection_time = 0
-        last_action = "Inicializando..."
-        
-        # Loop principal
-        while bot_running and not shutdown_event.is_set():
+        while running:
             now = time.time()
-            
-            # === 1. AUTO-RESUME: Verificar se pode retomar apos pausa ===
-            try:
-                if risk_manager.is_paused and risk_manager.pause_time > 0:
-                    elapsed_pause = now - risk_manager.pause_time
-                    if elapsed_pause >= CONSECUTIVE_LOSS_COOLDOWN:
-                        # Retomar apenas se pausa foi por perdas consecutivas
-                        if "consecutiv" in risk_manager.pause_reason.lower():
-                            logger.info(
-                                f"Auto-resume: cooldown de {CONSECUTIVE_LOSS_COOLDOWN}s expirado. "
-                                f"Retomando operacoes."
-                            )
-                            risk_manager.force_resume()
-                            last_action = f"Auto-resume apos {CONSECUTIVE_LOSS_COOLDOWN//60}min de cooldown"
-                            try:
-                                notifier.send_message(
-                                    f"Bot retomado automaticamente apos cooldown de "
-                                    f"{CONSECUTIVE_LOSS_COOLDOWN//60}min"
-                                )
-                            except Exception:
-                                pass
-            except Exception as e:
-                logger.warning(f"Erro no auto-resume: {e}")
-            
-            # === 2. MONITORAR POSICOES (prioridade maxima) ===
-            try:
-                if now - last_monitor_time >= MONITOR_INTERVAL_SECONDS:
-                    # Atualizar saldo
-                    try:
-                        balance = client.get_futures_balance()
-                        risk_manager.update_balance(balance)
-                    except Exception:
-                        pass
-                    
-                    # Monitorar posicoes (SL/TP/trailing/time stop)
-                    if position_manager.get_open_count() > 0:
-                        closed = position_manager.monitor_cycle()
-                        for trade in closed:
-                            try:
+
+            # === 1. SELECIONAR MOEDAS SE NECESSARIO ===
+            needed = portfolio.needs_new_coins()
+            if needed > 0 and (now - last_selection_attempt) >= selection_cooldown:
+                last_selection_attempt = now
+                try:
+                    status = f"Selecionando {needed} moedas..."
+                    render_dashboard(portfolio, dca, status, last_action)
+
+                    coins = select_best_coins(client, needed)
+
+                    if coins:
+                        capital_per_coin = balance * CAPITAL_PER_COIN_PCT
+
+                        for coin in coins:
+                            symbol = coin["symbol"]
+                            direction = coin["direction"]
+
+                            # Pular se ja temos posicao
+                            if symbol in dca.positions:
+                                continue
+
+                            pos = dca.open_position(symbol, direction, capital_per_coin)
+                            if pos:
                                 last_action = (
-                                    f"Fechou {trade['symbol']} ({trade['reason']}): "
-                                    f"P&L {trade['pnl']:+.2f}"
+                                    f"ENTRADA {direction} {symbol} @ "
+                                    f"{format_price(pos.avg_entry_price)} "
+                                    f"(score: {coin['score']:.3f})"
                                 )
-                                
-                                # Adicionar cooldown para o simbolo
-                                symbol_cooldowns[trade['symbol']] = now + SYMBOL_COOLDOWN
-                                
-                                notifier.notify_position_close(
-                                    trade["symbol"], trade["side"], trade["reason"],
-                                    trade["pnl"], trade["pnl_percent"], trade["duration_min"]
-                                )
-                            except Exception as e:
-                                logger.warning(f"Erro ao processar trade fechado: {e}")
-                            
-                            # Verificar alertas de risco
-                            try:
-                                if risk_manager.daily_loss_triggered:
-                                    notifier.notify_risk_alert(
-                                        "Perda Diaria Maxima",
-                                        f"Perda diaria de {risk_manager.get_daily_loss_percent():.2f}%"
-                                    )
-                                if risk_manager.drawdown_triggered:
-                                    notifier.notify_risk_alert(
-                                        "Drawdown Maximo",
-                                        f"Drawdown de {risk_manager.get_current_drawdown():.2f}%"
-                                    )
-                            except Exception:
-                                pass
-                    
-                    last_monitor_time = now
-            except Exception as e:
-                logger.warning(f"Erro no monitoramento: {e}")
-            
-            # === 3. RE-SELECIONAR ATIVOS ===
+                                time.sleep(0.5)  # Rate limit
+
+                        # Atualizar saldo
+                        portfolio.current_balance = client.get_balance_safe()
+                        if portfolio.current_balance <= 0:
+                            portfolio.current_balance = balance
+
+                        status = "Operando"
+                    else:
+                        last_action = f"Nenhuma moeda encontrada. Tentando novamente em {selection_cooldown}s..."
+                        status = f"Aguardando ({selection_cooldown}s)"
+                        logger.info(last_action)
+
+                except Exception as e:
+                    logger.error(f"Erro na selecao: {e}")
+                    last_action = f"Erro na selecao: {e}"
+                    status = "Aguardando..."
+
+            # === 2. ATUALIZAR PRECOS ===
+            if now - last_price_update >= MONITOR_INTERVAL:
+                try:
+                    dca.update_all_prices()
+                    last_price_update = now
+                except Exception as e:
+                    logger.error(f"Erro ao atualizar precos: {e}")
+
+            # === 3. VERIFICAR DCA ===
+            if now - last_dca_check >= DCA_CHECK_INTERVAL:
+                try:
+                    for symbol in list(dca.positions.keys()):
+                        pos = dca.positions.get(symbol)
+                        if not pos or pos.status != "ACTIVE":
+                            continue
+
+                        executed = dca.check_and_execute_dca(symbol)
+                        if executed:
+                            last_action = (
+                                f"DCA #{pos.dca_count} {symbol} @ "
+                                f"{format_price(pos.current_price)} | "
+                                f"Novo medio: {format_price(pos.avg_entry_price)}"
+                            )
+                    last_dca_check = now
+                except Exception as e:
+                    logger.error(f"Erro no DCA check: {e}")
+
+            # === 4. VERIFICAR STOP PROFIT GLOBAL ===
+            if dca.count_active() > 0:
+                try:
+                    if portfolio.check_global_take_profit():
+                        status = "STOP PROFIT!"
+                        render_dashboard(portfolio, dca, status, last_action)
+                        pnl = portfolio.execute_global_take_profit()
+                        last_action = f"STOP PROFIT GLOBAL: {format_pnl(pnl)} USDT"
+                        logger.info(last_action)
+
+                        # Atualizar saldo para proximo ciclo
+                        balance = client.get_balance_safe()
+                        if balance > 0:
+                            portfolio.current_balance = balance
+                        else:
+                            balance = portfolio.current_balance
+
+                        status = "Novo ciclo..."
+                        time.sleep(3)
+                        continue
+
+                    if portfolio.check_global_stop_loss():
+                        status = "STOP LOSS!"
+                        render_dashboard(portfolio, dca, status, last_action)
+                        pnl = portfolio.execute_global_stop_loss()
+                        last_action = f"STOP LOSS GLOBAL: {format_pnl(pnl)} USDT"
+                        logger.info(last_action)
+
+                        balance = client.get_balance_safe()
+                        if balance > 0:
+                            portfolio.current_balance = balance
+                        else:
+                            balance = portfolio.current_balance
+
+                        status = "Recuperando..."
+                        time.sleep(10)
+                        continue
+
+                except Exception as e:
+                    logger.error(f"Erro no check global: {e}")
+
+            # === 5. FECHAR MOEDAS INDIVIDUAIS COM LUCRO BOM ===
+            # Se uma moeda individual tem +1% de lucro, fecha para garantir
+            # e abre uma nova no lugar
             try:
-                if now - last_selection_time >= SELECTION_INTERVAL_SECONDS:
-                    try:
-                        strategy.select_assets()
-                        if strategy.selected_assets:
-                            last_action = f"Ativos: {', '.join(strategy.selected_assets)}"
-                    except Exception as e:
-                        logger.warning(f"Erro na selecao de ativos: {e}")
-                    last_selection_time = now
+                closed = portfolio.close_profitable_individual(min_profit_pct=1.0)
+                for sym, pnl in closed:
+                    last_action = f"FECHOU {sym} (lucro individual): {format_pnl(pnl)} USDT"
+                    logger.info(last_action)
             except Exception as e:
-                logger.warning(f"Erro no bloco de selecao: {e}")
-            
-            # === 4. BUSCAR NOVAS ENTRADAS ===
-            try:
-                entry_interval = get_jitter(ENTRY_INTERVAL_SECONDS, ENTRY_JITTER_SECONDS)
-                if now - last_entry_time >= entry_interval:
-                    can_open, reason = risk_manager.can_open_position(
-                        position_manager.get_open_count()
-                    )
-                    
-                    if can_open and strategy.selected_assets:
-                        # Excluir simbolos com posicao aberta E em cooldown
-                        exclude = set(position_manager.get_open_symbols())
-                        for sym, cd_time in list(symbol_cooldowns.items()):
-                            if cd_time > now:
-                                exclude.add(sym)
-                            else:
-                                del symbol_cooldowns[sym]
-                        
-                        try:
-                            opportunities = strategy.find_opportunities(list(exclude))
-                            
-                            if opportunities:
-                                last_action = f"Encontradas {len(opportunities)} oportunidades"
-                            else:
-                                last_action = f"Sem oportunidades ({len(strategy.selected_assets)} ativos)"
-                            
-                            for opp in opportunities:
-                                # Verificar novamente antes de cada entrada
-                                can_open, reason = risk_manager.can_open_position(
-                                    position_manager.get_open_count()
-                                )
-                                if not can_open:
-                                    last_action = f"Entrada bloqueada: {reason}"
-                                    break
-                                
-                                try:
-                                    symbol = opp["symbol"]
-                                    direction = opp["signal"]
-                                    atr = opp["atr"]
-                                    price = opp["price"]
-                                    
-                                    # Position sizing
-                                    quantity, stop_dist, capital_risk = risk_manager.calculate_position_size(
-                                        balance, atr, price
-                                    )
-                                    
-                                    if quantity <= 0:
-                                        logger.info(f"Quantidade zero para {symbol}, pulando")
-                                        continue
-                                    
-                                    # Validar quantidade maxima via exchange info
-                                    try:
-                                        filters = client.get_symbol_filters(symbol)
-                                        max_qty_filter = filters.get("MARKET_LOT_SIZE", filters.get("LOT_SIZE", {}))
-                                        max_qty = float(max_qty_filter.get("maxQty", 999999999))
-                                        if quantity > max_qty:
-                                            logger.warning(
-                                                f"{symbol}: qty {quantity:.4f} > maxQty {max_qty}. "
-                                                f"Reduzindo para maxQty."
-                                            )
-                                            quantity = max_qty * 0.95  # 95% do max
-                                    except Exception:
-                                        pass
-                                    
-                                    # Calcular SL/TP
-                                    sl, tp = risk_manager.calculate_sl_tp(price, stop_dist, direction)
-                                    
-                                    # Configurar simbolo
-                                    client.set_leverage(symbol, LEVERAGE)
-                                    client.set_margin_type(symbol, "CROSSED")
-                                    
-                                    # Abrir posicao
-                                    side = "BUY" if direction == "LONG" else "SELL"
-                                    order = client.place_market_order(symbol, side, quantity)
-                                    
-                                    if order:
-                                        # Tentar colocar SL e TP na exchange
-                                        sl_side = "SELL" if direction == "LONG" else "BUY"
-                                        
-                                        sl_order = client.place_stop_loss(
-                                            symbol, sl_side, sl,
-                                            close_position=True, quantity=quantity
-                                        )
-                                        tp_order = client.place_take_profit(
-                                            symbol, sl_side, tp,
-                                            close_position=True, quantity=quantity
-                                        )
-                                        
-                                        has_exchange_sl = sl_order is not None
-                                        has_exchange_tp = tp_order is not None
-                                        
-                                        if not has_exchange_sl:
-                                            logger.info(
-                                                f"SL/TP de {symbol} sera gerenciado por SOFTWARE "
-                                                f"(SL: {sl:.4f}, TP: {tp:.4f})"
-                                            )
-                                        
-                                        # Registrar posicao
-                                        entry_price = float(order.get("avgPrice", price))
-                                        if entry_price == 0:
-                                            entry_price = price
-                                        
-                                        exec_qty = float(order.get("executedQty", quantity))
-                                        if exec_qty > 0:
-                                            quantity = exec_qty
-                                        
-                                        pos = Position(
-                                            symbol=symbol,
-                                            side=direction,
-                                            quantity=quantity,
-                                            entry_price=entry_price,
-                                            stop_loss=sl,
-                                            take_profit=tp,
-                                            sl_order_id=str(sl_order.get("orderId", "")) if sl_order else None,
-                                            tp_order_id=str(tp_order.get("orderId", "")) if tp_order else None,
-                                            has_exchange_sl=has_exchange_sl,
-                                            has_exchange_tp=has_exchange_tp,
-                                        )
-                                        position_manager.add_position(pos)
-                                        
-                                        # Notificar
-                                        notifier.notify_position_open(
-                                            symbol, direction, quantity,
-                                            entry_price, sl, tp
-                                        )
-                                        
-                                        sl_mode_str = "EXCHANGE" if has_exchange_sl else "SOFTWARE"
-                                        last_action = (
-                                            f"ENTRADA: {direction} {quantity:.4f} {symbol} "
-                                            f"@ {entry_price:.4f} (SL/TP: {sl_mode_str})"
-                                        )
-                                        
-                                        logger.info(
-                                            f"ENTRADA: {direction} {quantity:.4f} {symbol} "
-                                            f"@ {entry_price:.4f} | SL: {sl:.4f} | TP: {tp:.4f} "
-                                            f"| Modo: {sl_mode_str}"
-                                        )
-                                
-                                except Exception as e:
-                                    logger.error(f"Erro ao abrir posicao em {opp['symbol']}: {e}")
-                                    last_action = f"Erro ao abrir {opp['symbol']}: {e}"
-                        
-                        except Exception as e:
-                            logger.error(f"Erro ao buscar oportunidades: {e}")
-                            last_action = f"Erro na busca: {e}"
-                    
-                    elif not can_open:
-                        last_action = f"Entradas bloqueadas: {reason}"
-                    elif not strategy.selected_assets:
-                        last_action = "Aguardando selecao de ativos..."
-                    
-                    last_entry_time = now
-            except Exception as e:
-                logger.warning(f"Erro no bloco de entradas: {e}")
-            
-            # === 5. ATUALIZAR DASHBOARD (nunca pode crashar o loop) ===
-            try:
-                if now - last_dashboard_time >= DASHBOARD_REFRESH_SECONDS:
-                    print_dashboard(
-                        client, risk_manager, position_manager,
-                        strategy, use_testnet, last_action, symbol_cooldowns
-                    )
-                    last_dashboard_time = now
-            except Exception as e:
-                # Dashboard NUNCA pode parar o bot
-                logger.debug(f"Erro no dashboard: {e}")
-            
+                logger.error(f"Erro ao fechar individuais: {e}")
+
+            # === 6. DASHBOARD ===
+            if now - last_dashboard >= DASHBOARD_INTERVAL:
+                try:
+                    render_dashboard(portfolio, dca, status, last_action)
+                    last_dashboard = now
+                except Exception as e:
+                    logger.error(f"Erro no dashboard: {e}")
+
             # Sleep curto para nao sobrecarregar
             time.sleep(1)
-        
-        # Shutdown ordenado
-        print(f"\n{Fore.YELLOW}  Encerrando bot...{Style.RESET_ALL}")
-        
-        # Fechar posicoes
-        open_count = position_manager.get_open_count()
-        if open_count > 0:
-            print_info(f"Fechando {open_count} posicao(oes)...")
-            closed = position_manager.close_all()
-            print_success(f"{closed} posicao(oes) fechada(s).")
-        
-        # Parar Telegram
-        notifier.stop_polling()
-        notifier.notify_bot_stop("Encerramento manual (Ctrl+C)")
-        
-        # Resumo da sessao
-        print_header("RESUMO DA SESSAO")
-        try:
-            risk = risk_manager.get_risk_summary()
-            for key, val in risk.items():
-                print(f"  {Fore.CYAN}{key:<25}{Fore.WHITE}{val}{Style.RESET_ALL}")
-        except Exception:
-            print(f"  {Fore.RED}Erro ao gerar resumo{Style.RESET_ALL}")
-        
-        bot_running = False
-        
-    except Exception as e:
-        logger.error(f"Erro fatal: {e}")
-        print_error(f"Erro fatal: {e}")
-        import traceback
-        traceback.print_exc()
-        bot_running = False
-    
-    input(f"\n  {Fore.WHITE}Pressione Enter para voltar ao menu...{Style.RESET_ALL}")
+
+    except KeyboardInterrupt:
+        print(f"\n\n  {C.YELLOW}{C.BOLD}Bot interrompido pelo usuario.{C.RESET}")
+        logger.info("Bot interrompido pelo usuario")
+
+        # Perguntar se quer fechar posicoes
+        if dca.count_active() > 0:
+            print(f"\n  {C.YELLOW}Voce tem {dca.count_active()} posicoes abertas.{C.RESET}")
+            choice = input(f"  Fechar todas? (s/n): ").strip().lower()
+            if choice == "s":
+                pnl = dca.close_all(reason="USER_STOP")
+                print(f"  {C.GREEN}Posicoes fechadas. P&L: {format_pnl(pnl)} USDT{C.RESET}")
+            else:
+                print(f"  {C.YELLOW}Posicoes mantidas abertas na exchange.{C.RESET}")
+
+        # Resumo final
+        stats = portfolio.get_session_stats()
+        print(f"\n  {C.BOLD}RESUMO DA SESSAO{C.RESET}")
+        print(f"  {'─' * 40}")
+        print(f"  Duracao:       {stats['duracao_min']:.0f} minutos")
+        print(f"  Ciclos:        {stats['ciclos']}")
+        print(f"  P&L Total:     {pnl_color(stats['pnl_total'])}{format_pnl(stats['pnl_total'])} USDT{C.RESET}")
+        print(f"  P&L Realizado: {pnl_color(stats['pnl_realizado'])}{format_pnl(stats['pnl_realizado'])} USDT{C.RESET}")
+        print(f"  Saldo Final:   {stats['saldo_atual']:.2f} USDT")
+        print()
 
 
 # ============================================
-# PONTO DE ENTRADA
+# MAIN
 # ============================================
 def main():
-    """Funcao principal."""
-    print_banner()
-    print_disclaimer()
-    
-    input(f"  {Fore.WHITE}Pressione Enter para continuar...{Style.RESET_ALL}")
-    
+    print(BANNER)
+    print(DISCLAIMER)
+
     # Selecionar modo
     use_testnet = select_mode()
-    
-    # Validar configuracao
+
+    # Validar config
     errors = validate_config(use_testnet)
     if errors:
-        print_header("ERROS DE CONFIGURACAO")
-        for err in errors:
-            print_error(err)
-        print(f"\n  {Fore.WHITE}Configure o arquivo .env com suas credenciais.")
-        print(f"  Use .env.example como referencia.{Style.RESET_ALL}")
-        input(f"\n  Pressione Enter para sair...")
+        print(f"\n{C.RED}{C.BOLD}Erros de configuracao:{C.RESET}")
+        for e in errors:
+            print(f"  {C.RED}• {e}{C.RESET}")
+        print(f"\n{C.YELLOW}Configure o arquivo .env e tente novamente.{C.RESET}")
         sys.exit(1)
-    
-    # Conectar a Binance
-    mode_text = "TESTNET" if use_testnet else "CONTA REAL"
-    print_info(f"Conectando a Binance ({mode_text})...")
-    
+
+    # Conectar
+    api_key, api_secret = get_api_keys(use_testnet)
+    print(f"\n  {C.CYAN}Conectando a Binance...{C.RESET}")
+
     try:
-        api_key, api_secret = get_api_keys(use_testnet)
         client = BinanceClientWrapper(api_key, api_secret, testnet=use_testnet)
-        
-        # Testar conexao
-        balance = client.get_futures_balance()
-        print_success(f"Conectado! Saldo: {balance:,.2f} USDT")
+        balance = client.get_balance()
+        print(f"  {C.GREEN}✓ Conectado! Saldo: {balance:.2f} USDT{C.RESET}")
     except Exception as e:
-        print_error(f"Falha ao conectar: {e}")
-        print_info("Verifique suas credenciais no arquivo .env")
-        input(f"\n  Pressione Enter para sair...")
+        print(f"\n  {C.RED}Erro ao conectar: {e}{C.RESET}")
         sys.exit(1)
-    
-    # Loop do menu principal
+
+    # Menu principal
     while True:
-        print_banner()
-        choice = main_menu(use_testnet)
-        
-        if choice == "0":
-            print_info("Encerrando...")
-            break
-        
-        elif choice == "1":
+        clear()
+        mode_str = f"{C.GREEN}TESTNET{C.RESET}" if use_testnet else f"{C.RED}CONTA REAL{C.RESET}"
+        print(f"\n  {C.BOLD}DCA Bot Inteligente{C.RESET} │ {mode_str} │ Saldo: {balance:.2f} USDT")
+        show_menu()
+
+        choice = input(f"  {C.CYAN}Escolha: {C.RESET}").strip()
+
+        if choice == "1":
             run_bot(client, use_testnet)
-        
         elif choice == "2":
-            show_balance_and_positions(client)
-        
+            show_balance(client)
         elif choice == "3":
-            show_market_analysis(client)
-        
+            preview_coins(client)
         elif choice == "4":
-            run_backtest_menu(client)
-        
-        elif choice == "5":
             show_config(use_testnet)
-        
+        elif choice == "5":
+            close_all_menu(client)
         elif choice == "6":
-            test_telegram()
-        
-        elif choice == "7":
-            # Trocar modo
-            use_testnet = not use_testnet
-            mode_text = "TESTNET" if use_testnet else "CONTA REAL"
-            
-            errors = validate_config(use_testnet)
-            if errors:
-                print_error(f"Credenciais para {mode_text} nao configuradas!")
-                use_testnet = not use_testnet  # Reverter
-                input(f"\n  Pressione Enter para voltar...")
-                continue
-            
-            if not use_testnet:
-                print(f"\n{Fore.RED}  ATENCAO: Trocando para CONTA REAL!")
-                confirm = input(f"  {Fore.YELLOW}Digite 'CONFIRMO': {Style.RESET_ALL}").strip()
-                if confirm != "CONFIRMO":
-                    use_testnet = not use_testnet
-                    print_warning("Operacao cancelada.")
-                    input(f"\n  Pressione Enter para voltar...")
-                    continue
-            
+            use_testnet = select_mode()
+            api_key, api_secret = get_api_keys(use_testnet)
             try:
-                api_key, api_secret = get_api_keys(use_testnet)
                 client = BinanceClientWrapper(api_key, api_secret, testnet=use_testnet)
-                balance = client.get_futures_balance()
-                print_success(f"Modo alterado para {mode_text}! Saldo: {balance:,.2f} USDT")
+                balance = client.get_balance()
+                print(f"  {C.GREEN}✓ Reconectado! Saldo: {balance:.2f} USDT{C.RESET}")
+                time.sleep(1)
             except Exception as e:
-                print_error(f"Falha ao conectar em {mode_text}: {e}")
-                use_testnet = not use_testnet  # Reverter
-            
-            input(f"\n  Pressione Enter para continuar...")
-        
-        elif choice == "8":
-            close_all_positions_menu(client)
-        
+                print(f"  {C.RED}Erro: {e}{C.RESET}")
+                time.sleep(2)
+        elif choice == "0":
+            print(f"\n  {C.DIM}Ate logo!{C.RESET}\n")
+            sys.exit(0)
         else:
-            print_error("Opcao invalida!")
+            print(f"  {C.YELLOW}Opcao invalida.{C.RESET}")
             time.sleep(1)
-    
-    print(f"\n{Fore.CYAN}  Ate logo!{Style.RESET_ALL}\n")
 
 
 if __name__ == "__main__":
